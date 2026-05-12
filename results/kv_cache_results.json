@@ -1,0 +1,7 @@
+{
+  "total_requests": 500,
+  "compressions": 219,
+  "offloads": 296,
+  "cache_reuses": 189,
+  "memory_saved_mb": 18538.26
+}
