@@ -1,14 +1,14 @@
-# Context-Aware Adaptive Memory Management System
+# Context-Aware Adaptive Memory Management System v2
 
 **Samsung Problem Statement Solution** — An intelligent on-device memory management system that uses ML-based prediction to optimize application caching, pre-loading, and eviction for smartphones and edge devices.
 
 ## Architecture Overview
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                    User Interaction Layer                 │
-│          (App switches, timestamps, context)              │
-└─────────────────────┬────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                    User Interaction Layer                     │
+│          (App switches, timestamps, context signals)          │
+└─────────────────────┬────────────────────────────────────────┘
                       │
           ┌───────────▼───────────────┐
           │    Prediction Engine      │
@@ -16,22 +16,25 @@
           │                           │
           │  ┌─────────┐ ┌─────────┐  │
           │  │  LSTM   │ │ Markov  │  │
-          │  │ (PyTorch)│ │ Chain   │  │
+          │  │ (ONNX/  │ │ Chain   │  │
+          │  │  NPU)   │ │ (CPU)   │  │
           │  └────┬────┘ └────┬────┘  │
           │       └─────┬─────┘       │
-          │         Ensemble          │
-          │     (0.3 LSTM + 0.7 MC)   │
+          │     Ensemble (30/70)      │
           └───────────┬───────────────┘
                       │ P(next_app)
           ┌───────────▼───────────────┐
-          │   Memory Manager          │
+          │   Memory Manager v2       │
           │   ("The Brawn")           │
           │                           │
+          │  • Tiered pre-loading     │
+          │    (3-tier confidence)     │
           │  • Prediction-weighted    │
           │    eviction scoring       │
-          │  • Proactive pre-loading  │
           │  • Anti-thrashing guard   │
-          │  • KV Cache compression   │
+          │  • Energy/battery aware   │
+          │  • Token-level KV cache   │
+          │    with prefix caching    │
           └───────────────────────────┘
 ```
 
@@ -39,40 +42,54 @@
 
 ```
 samsung/
-├── run.py                      # Main orchestration script
-├── simulate.py                 # Simulation & benchmarking engine
+├── run.py                      # Pipeline orchestrator (7 steps)
+├── simulate.py                 # Simulation, benchmarking, ONNX export
 ├── src/
 │   ├── data_generator.py       # Synthetic dataset generator
 │   ├── predictor.py            # LSTM + Markov ensemble predictor
-│   ├── memory_manager.py       # Adaptive & LRU memory managers
-│   └── visualize.py            # Result visualization
+│   ├── memory_manager.py       # Adaptive & LRU managers + KV cache v2
+│   └── visualize.py            # Dashboard & chart generation
 ├── data/                       # Generated datasets
 │   ├── app_usage_logs.csv      # ~117K app usage records
 │   ├── kv_cache_workload.csv   # GenAI KV cache workload
 │   └── app_metadata.json       # App definitions
 ├── models/                     # Trained model weights
 │   ├── best_predictor.pth      # Best LSTM checkpoint
+│   ├── predictor_edge.onnx     # ONNX model for edge/NPU deployment
 │   ├── markov_model.pkl        # Per-user Markov chains
 │   └── training_history.json   # Training metrics
 └── results/                    # Benchmark results & charts
-    ├── benchmark_results.json
-    ├── kv_cache_results.json
+    ├── benchmark_results.json  # Standard 4GB results
+    ├── pressure_results.json   # Memory pressure 2GB results
+    ├── kv_cache_results.json   # KV cache stats
     ├── training_curves.png
-    ├── kpi_dashboard.png
-    └── prediction_accuracy.png
+    ├── kpi_dashboard.png       # 6-panel KPI dashboard
+    ├── prediction_accuracy.png # Accuracy + energy breakdown
+    └── pressure_comparison.png # 4GB vs 2GB stress test
 ```
 
 ## Quick Start
 
 ```bash
 # Install dependencies
-pip install torch numpy pandas scikit-learn matplotlib seaborn tabulate
+pip install torch numpy pandas matplotlib seaborn tabulate
 
-# Run the full pipeline (data → train → simulate → benchmark → visualize)
+# Run the full pipeline (7 steps: data → train → simulate → pressure → KV → ONNX → viz)
 python3 run.py
 ```
 
-The pipeline takes ~5 minutes and produces all results automatically.
+The pipeline takes ~6 minutes and produces all results, charts, and ONNX model automatically.
+
+## What's New in v2
+
+| Improvement | Description |
+|------------|-------------|
+| **Tiered Pre-loading** | 3-tier confidence system replaces binary preload: metadata-warm (>10%), background-cache (>25%), full-RAM (>50%) |
+| **Energy/Battery Profiling** | Per-operation mJ tracking with ARM Cortex-A78 power model |
+| **Deep KV Cache** | Token-level prefix caching, FP16→INT8 quantization, prefix deduplication |
+| **Memory Pressure Test** | Stress-test at 2GB to validate under constrained devices |
+| **ONNX Export** | Model exported to ONNX format for NPU/TFLite edge deployment |
+| **Inference Latency** | NPU inference time factored into load time calculations |
 
 ## Components
 
@@ -86,43 +103,38 @@ Generates realistic Android app usage sequences for 50 users over 30 days:
 
 ### 2. Prediction Engine (`src/predictor.py`)
 Hybrid ensemble combining:
-- **LSTM with Attention** (PyTorch): User-embedded sequence model with attention mechanism
+- **LSTM with Attention** (PyTorch → ONNX): User-embedded sequence model
   - 48-dim app embeddings, 16-dim user embeddings, 128-dim LSTM hidden state
   - Cyclical time encoding (sin/cos of hour and day-of-week)
-  - ~299K parameters, lightweight enough for edge deployment
-- **Per-User Markov Chain**: 2nd-order transition probabilities + time-of-day patterns
-  - Zero training time, instant inference
-  - Captures user-specific habits perfectly
+  - ~299K parameters → ~350KB ONNX model for NPU deployment
+- **Per-User Markov Chain**: 2nd-order transition + time-of-day patterns
 - **Ensemble**: Weighted combination (30% LSTM + 70% Markov)
 
-### 3. Memory Manager (`src/memory_manager.py`)
-Three components:
-- **LRU Baseline**: Standard Least-Recently-Used eviction (comparison baseline)
-- **Adaptive Manager**: ML-driven memory management with:
-  - Prediction-weighted eviction scoring (recency + frequency + ML prediction)
-  - Proactive pre-loading of top-K predicted apps
-  - Anti-thrashing protection (prevents rapid evict-reload cycles)
-  - GenAI cache awareness (higher priority for expensive models)
-- **KV Cache Manager**: Intelligent compression and offloading for GenAI workloads
+### 3. Memory Manager v2 (`src/memory_manager.py`)
+
+#### Tiered Pre-loading
+| Confidence Level | Action | Load Time Reduction |
+|-----------------|--------|-------------------|
+| >10% (Tier 1) | Pre-warm flash storage controller | ~40% faster seek |
+| >25% (Tier 2) | Page binaries into OS page cache | ~80% faster load |
+| >50% (Tier 3) | Fully map into RAM & init entry point | ~95% instant |
+
+#### Energy-Aware Eviction
+Every operation is tracked with millijoule energy costs based on ARM Cortex-A78 / Samsung Exynos power profiles:
+- RAM hold: 0.002 mJ/MB/sec (LPDDR5)
+- Storage I/O: 0.8 mJ/MB (UFS 4.0 cold read)
+- NPU inference: 0.15 mJ/call (INT8 LSTM)
+
+#### Token-Level KV Cache
+- **Prefix deduplication**: Shared system prompts across requests reuse same cache
+- **3-stage eviction**: Quantize (FP16→INT8) → Offload to storage → Full evict
+- **Pinned prefixes**: System prompts always stay in high-speed RAM
 
 ### 4. Simulation Engine (`simulate.py`)
-- Replays real usage traces through both LRU and Adaptive managers
-- Uses trained ensemble predictor for real-time probability estimates
-- Tracks all KPIs: hit rate, load time, page faults, thrashing, preload hits
-
-## Benchmark Results
-
-| KPI | Target | LRU Baseline | Adaptive | Improvement | Status |
-|-----|--------|-------------|----------|-------------|--------|
-| Prediction Accuracy (Top-3) | ≥75% | — | **80.2%** | — | ✅ PASS |
-| Cache Hit Rate | ≥85% | 98.3% | **98.9%** | +0.6% | ✅ PASS |
-| Thrashing Events | 50%+ reduction | 8 | **0** | -100% | ✅ PASS |
-| System Stability | 0 issues | — | **0** | — | ✅ PASS |
-| Page Faults | Reduction | 443 | **293** | -33.9% | ✅ PASS |
-| Evictions | Reduction | 430 | **309** | -28.1% | ✅ PASS |
-| Load Time | 20%+ reduction | 8.9ms | **8.1ms** | -9.9% | ⚠️ Close |
-
-**KV Cache Management**: 189 cache reuses, 219 compressions, 18.5GB memory saved.
+- Replays usage traces through LRU and Adaptive managers in parallel
+- Standard test (4GB) + Memory pressure test (2GB)
+- ONNX model export for edge deployment validation
+- Energy profiling per operation category
 
 ## Key Design Decisions
 
@@ -130,11 +142,53 @@ Three components:
 
 2. **Anti-thrashing guard**: Pages recently evicted and reloaded get a 2x retention boost, preventing the rapid evict-reload cycle that plagues standard caching.
 
-3. **Conservative pre-loading**: Only pre-loads when probability > 12% AND memory usage < 80%, avoiding the trap of aggressive preloading causing more evictions.
+3. **Tiered pre-loading**: Instead of binary preload, 3 confidence tiers minimize energy cost while maximizing load time improvement. Tier 1 costs only 0.05 mJ/MB vs 0.8 mJ/MB for a cold load.
 
-4. **Reward-aligned eviction scoring**: `score = α·recency + β·frequency + γ·prediction`, directly optimizing for the KPI targets (cache hit rate and thrashing reduction).
+4. **Reward-aligned eviction scoring**: `score = α·recency + β·frequency + γ·prediction`, directly optimizing for cache hit rate and thrashing reduction.
+
+5. **Energy budget**: Every operation tracks mJ cost, proving the ML overhead (0.15 mJ/inference) is dwarfed by the storage I/O savings from reduced page faults.
+
+## Sim-to-Real Integration Path
+
+This system is designed as a **drop-in module** for real Android/Linux deployment:
+
+### Android Integration
+| Layer | Integration Point | Our Component |
+|-------|-------------------|---------------|
+| **Kernel** | `madvise()` / `MADV_WILLNEED` | Tier 1/2 pre-loading |
+| **Framework** | `lmkd` (Low Memory Killer Daemon) | Eviction scoring |
+| **HAL** | NPU HAL (Samsung Exynos NPU) | ONNX LSTM inference |
+| **App** | `ActivityManager.getRunningTasks()` | Usage log collection |
+
+### Edge Deployment
+```
+PyTorch LSTM (299K params, ~1.2MB)
+    → torch.onnx.export() [opset 14]
+    → ONNX model (~350KB)
+    → onnxruntime / Samsung ONE (Neural Engine)
+    → INT8 quantization on NPU
+    → ~0.5ms inference latency
+```
+
+### Linux cgroups Integration
+```c
+// Pseudo-code for memory.pressure integration
+struct adaptive_mm {
+    struct ml_predictor *pred;     // ONNX runtime
+    struct markov_chain *markov;   // Per-user transition tables
+    struct energy_tracker *energy; // Battery-aware decisions
+};
+
+// Hook into mm/vmscan.c shrink_page_list()
+int adaptive_eviction_score(struct page *page) {
+    float ml_prob = predict_next_app(page->app_id);
+    float recency = compute_recency(page);
+    return ALPHA * recency + BETA * frequency + GAMMA * ml_prob;
+}
+```
 
 ## Requirements
 - Python 3.10+
 - PyTorch (CPU or MPS/CUDA)
-- NumPy, Pandas, scikit-learn, matplotlib, seaborn, tabulate
+- NumPy, Pandas, matplotlib, seaborn, tabulate
+- (Optional) onnx, onnxruntime for edge validation

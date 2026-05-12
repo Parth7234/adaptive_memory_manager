@@ -1,7 +1,10 @@
 {
   "total_requests": 500,
-  "compressions": 219,
-  "offloads": 296,
-  "cache_reuses": 189,
-  "memory_saved_mb": 18538.26
+  "compressions": 381,
+  "quantizations": 273,
+  "offloads": 273,
+  "cache_reuses": 118,
+  "prefix_dedup_hits": 496,
+  "memory_saved_mb": 49621.11725000001,
+  "energy_mj": 26390.228474999964
 }
