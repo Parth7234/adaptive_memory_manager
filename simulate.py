@@ -70,6 +70,13 @@ def run_simulation(df, ensemble, device, total_memory_mb=4096,
         recent_apps = list(user_df["app_id"].values[:SEQ_LEN])
         timestamps = pd.to_datetime(user_df["timestamp"])
         t0 = timestamps.iloc[0]
+        # Compute time deltas for the seed sequence
+        recent_deltas = []
+        for j in range(SEQ_LEN):
+            if j == 0:
+                recent_deltas.append(0.0)
+            else:
+                recent_deltas.append(max(0, (timestamps.iloc[j] - timestamps.iloc[j-1]).total_seconds()))
 
         for idx in range(SEQ_LEN, len(user_df)):
             row = user_df.iloc[idx]
@@ -78,8 +85,11 @@ def run_simulation(df, ensemble, device, total_memory_mb=4096,
             hour = int(row["hour"])
             dow = int(row["day_of_week"])
             timestamp = (timestamps.iloc[idx] - t0).total_seconds()
+            # Time delta since previous access
+            dt = max(0, (timestamps.iloc[idx] - timestamps.iloc[idx-1]).total_seconds())
 
-            probs = ensemble.predict_proba(uid, recent_apps, hour, dow)
+            probs = ensemble.predict_proba(uid, recent_apps, hour, dow,
+                                            time_deltas=recent_deltas)
             predicted = np.argmax(probs)
             top3 = np.argsort(probs)[-3:]
 
@@ -92,8 +102,10 @@ def run_simulation(df, ensemble, device, total_memory_mb=4096,
                           prediction_probs=probs, app_sizes=app_sizes)
 
             recent_apps.append(app_id)
+            recent_deltas.append(dt)
             if len(recent_apps) > SEQ_LEN:
                 recent_apps.pop(0)
+                recent_deltas.pop(0)
 
     ls = lru.get_stats()
     as_ = adaptive.get_stats()
