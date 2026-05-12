@@ -32,6 +32,15 @@ ENERGY_COSTS = {
     "npu_inference_per_call": 0.15,     # mJ per LSTM inference on NPU (INT8)
     "kv_compress_per_mb": 0.4,          # mJ per MB of KV cache FP16->INT8 quantization
     "kv_offload_per_mb": 0.6,           # mJ per MB offloaded to storage
+    "zram_compress_per_mb": 0.05,       # mJ per MB LZ4 compress to ZRAM
+    "zram_decompress_per_mb": 0.03,     # mJ per MB LZ4 decompress from ZRAM
+}
+
+# Startup page cluster ratios — fraction of app binary needed for first-frame render
+APP_STARTUP_CLUSTER = {
+    0: 0.25, 1: 0.30, 2: 0.20, 3: 0.25, 4: 0.30, 5: 0.20, 6: 0.15,
+    7: 0.15, 8: 0.20, 9: 0.25, 10: 0.20, 11: 0.20, 12: 0.25, 13: 0.35,
+    14: 0.35, 15: 0.30, 16: 0.40, 17: 0.35, 18: 0.10, 19: 0.08,
 }
 
 
@@ -81,6 +90,10 @@ class MemoryStats:
     preload_tier1_hits: int = 0  # metadata-warmed
     preload_tier2_hits: int = 0  # bg-cached
     preload_tier3_hits: int = 0  # full-RAM
+    zram_hits: int = 0           # restored from ZRAM compressed tier
+    zram_stores: int = 0         # evicted to ZRAM instead of storage
+    ghost_hits_b1: int = 0       # ARC ghost cache B1 hits (recent-evicted)
+    ghost_hits_b2: int = 0       # ARC ghost cache B2 hits (freq-evicted)
     thrashing_events: int = 0
     total_load_time_ms: float = 0.0
     cold_load_time_ms: float = 0.0
@@ -219,6 +232,18 @@ class AdaptiveMemoryManager:
         # Metadata-warmed and bg-cached apps (not in RAM, but partially ready)
         self.metadata_warmed: Dict[int, float] = {}   # app_id -> timestamp
         self.bg_cached: Dict[int, float] = {}          # app_id -> timestamp
+        # ── ZRAM compressed tier ──
+        # Apps evicted from RAM go here first (LZ4 compressed, ~3x savings)
+        # Decompressing from ZRAM is ~100x faster than reading from UFS storage
+        self.zram_cache: Dict[int, Tuple[float, float]] = {}  # app_id -> (compressed_mb, timestamp)
+        self.zram_capacity_mb = total_memory_mb * 0.15  # 15% of RAM reserved for ZRAM
+        self.zram_used_mb = 0.0
+        self.zram_compress_ratio = 0.33  # LZ4 compresses to ~33% of original
+        # ── ARC ghost caches (remember evicted page IDs for self-tuning) ──
+        self.ghost_b1: OrderedDict = OrderedDict()  # ghost of recently-seen-once pages
+        self.ghost_b2: OrderedDict = OrderedDict()  # ghost of frequently-seen pages
+        self.arc_p: float = 0.5  # dynamic recency/frequency boundary [0,1]
+        self.ghost_max_size = 50  # max entries per ghost cache
 
     def _cold_load_time(self, size_mb: float) -> float:
         """Full cold load from storage to RAM."""
@@ -239,6 +264,10 @@ class AdaptiveMemoryManager:
     def _tier3_load_time(self, size_mb: float) -> float:
         """Fully pre-loaded in RAM: near-instant."""
         return 3 + size_mb * 0.02 + np.random.exponential(1)
+
+    def _zram_load_time(self, size_mb: float) -> float:
+        """Decompress from ZRAM: ~100x faster than UFS storage read."""
+        return 0.5 + size_mb * 0.05 + np.random.exponential(0.3)
 
     def _compute_eviction_score(self, page: MemoryPage, current_time: float) -> float:
         """LOWER score = MORE likely to be evicted."""
@@ -272,10 +301,12 @@ class AdaptiveMemoryManager:
     def tiered_preload(self, prediction_probs: np.ndarray,
                        app_sizes: Dict[int, float], timestamp: float):
         """
-        Tiered pre-loading based on prediction confidence.
+        Tiered pre-loading with Predictive Page Clustering.
+        Instead of loading the full app binary, only load the startup cluster
+        (the specific 4KB pages needed for first-frame render).
         Tier 1 (>10%): Pre-warm flash storage controller (fetch metadata)
-        Tier 2 (>25%): Page binaries into background OS cache
-        Tier 3 (>50%): Fully map into RAM and init app entry point
+        Tier 2 (>25%): Page startup cluster into OS page cache
+        Tier 3 (>50%): Fully map startup cluster into RAM
         """
         top_k = np.argsort(prediction_probs)[-self.preload_top_k:][::-1]
 
@@ -283,31 +314,35 @@ class AdaptiveMemoryManager:
             prob = prediction_probs[app_id]
             if app_id in self.cache:
                 continue  # already in RAM
+            if app_id in self.zram_cache:
+                continue  # already in ZRAM, will decompress on access
 
-            size = app_sizes.get(app_id, 100)
+            full_size = app_sizes.get(app_id, 100)
+            # Page Clustering: only preload the startup cluster, not the full binary
+            cluster_ratio = APP_STARTUP_CLUSTER.get(app_id, 0.25)
+            cluster_size = full_size * cluster_ratio
 
             if prob >= self.tier3_threshold:
-                # Tier 3: Full RAM mapping (only if memory allows)
-                if self.used_memory + size < self.total_memory * 0.85:
-                    page = MemoryPage(app_id=app_id, size_mb=size,
+                # Tier 3: Full RAM mapping of startup cluster only
+                if self.used_memory + cluster_size < self.total_memory * 0.85:
+                    page = MemoryPage(app_id=app_id, size_mb=full_size,
                                       last_access_time=timestamp,
                                       predicted_probability=prob,
                                       access_count=0, preload_tier=3)
                     self.cache[app_id] = page
-                    self.used_memory += size
+                    self.used_memory += full_size
                     self.stats.preloads += 1
                     self.stats.energy.preload_mj += (
-                        size * ENERGY_COSTS["preload_full_ram_per_mb"])
-                    # Remove from lower tiers if present
+                        cluster_size * ENERGY_COSTS["preload_full_ram_per_mb"])
                     self.metadata_warmed.pop(app_id, None)
                     self.bg_cached.pop(app_id, None)
 
             elif prob >= self.tier2_threshold:
-                # Tier 2: Background cache (no RAM cost, just OS page cache)
+                # Tier 2: Page startup cluster into OS page cache
                 if app_id not in self.bg_cached:
                     self.bg_cached[app_id] = timestamp
                     self.stats.energy.preload_mj += (
-                        size * ENERGY_COSTS["preload_bg_cache_per_mb"])
+                        cluster_size * ENERGY_COSTS["preload_bg_cache_per_mb"])
                     self.metadata_warmed.pop(app_id, None)
 
             elif prob >= self.tier1_threshold:
@@ -315,7 +350,7 @@ class AdaptiveMemoryManager:
                 if app_id not in self.metadata_warmed and app_id not in self.bg_cached:
                     self.metadata_warmed[app_id] = timestamp
                     self.stats.energy.preload_mj += (
-                        size * ENERGY_COSTS["preload_metadata_per_mb"])
+                        cluster_size * ENERGY_COSTS["preload_metadata_per_mb"])
 
     def access(self, app_id: int, size_mb: float, timestamp: float,
                prediction_probs: Optional[np.ndarray] = None,
@@ -355,16 +390,27 @@ class AdaptiveMemoryManager:
             self.stats.energy.hot_access_mj += size_mb * ENERGY_COSTS["hot_access_per_mb"]
 
         else:
-            # Cache miss — but check if we have a lower-tier preload
+            # Cache miss — check ZRAM → preload tiers → cold storage
             self.stats.cache_misses += 1
             self.stats.page_faults += 1
+
+            # ARC: adapt weights if this was a ghost cache hit
+            self._arc_adapt(app_id)
 
             # Evict if needed
             while self.used_memory + size_mb > self.total_memory and self.cache:
                 self._evict_lowest_score(timestamp)
 
-            # Determine load time based on preload tier
-            if app_id in self.bg_cached:
+            # Determine load time: ZRAM > Tier2 > Tier1 > Cold
+            if app_id in self.zram_cache:
+                # ZRAM hit: decompress from compressed RAM (~100x faster than UFS)
+                orig_size, _ = self.zram_cache.pop(app_id)
+                self.zram_used_mb -= orig_size * self.zram_compress_ratio
+                load_time = self._zram_load_time(size_mb)
+                self.stats.zram_hits += 1
+                self.stats.energy.eviction_mj += (
+                    size_mb * ENERGY_COSTS["zram_decompress_per_mb"])
+            elif app_id in self.bg_cached:
                 # Tier 2 hit: pages already in OS cache, fast mapping
                 load_time = self._tier2_load_time(size_mb)
                 self.stats.preload_hits += 1
@@ -377,7 +423,7 @@ class AdaptiveMemoryManager:
                 self.stats.preload_tier1_hits += 1
                 self.metadata_warmed.pop(app_id)
             else:
-                # Full cold load
+                # Full cold load from UFS storage
                 load_time = self._cold_load_time(size_mb)
 
             page = MemoryPage(
@@ -414,6 +460,7 @@ class AdaptiveMemoryManager:
         return load_time
 
     def _evict_lowest_score(self, timestamp: float):
+        """ARC-inspired eviction: evict to ZRAM first, then storage."""
         if not self.cache:
             return
 
@@ -435,11 +482,59 @@ class AdaptiveMemoryManager:
             if timestamp - page.last_access_time < 30:
                 self.stats.thrashing_events += 1
 
+            # ── ZRAM: compress evicted page to ZRAM instead of discarding ──
+            compressed_size = page.size_mb * self.zram_compress_ratio
+            if self.zram_used_mb + compressed_size <= self.zram_capacity_mb:
+                self.zram_cache[evict_id] = (page.size_mb, timestamp)
+                self.zram_used_mb += compressed_size
+                self.stats.zram_stores += 1
+                self.stats.energy.eviction_mj += (
+                    page.size_mb * ENERGY_COSTS["zram_compress_per_mb"])
+            else:
+                # ZRAM full — evict oldest ZRAM entry first, then store
+                if self.zram_cache:
+                    oldest_id = next(iter(self.zram_cache))
+                    old_size, _ = self.zram_cache.pop(oldest_id)
+                    self.zram_used_mb -= old_size * self.zram_compress_ratio
+                    if self.zram_used_mb + compressed_size <= self.zram_capacity_mb:
+                        self.zram_cache[evict_id] = (page.size_mb, timestamp)
+                        self.zram_used_mb += compressed_size
+                        self.stats.zram_stores += 1
+
+            # ── ARC: record in ghost cache for self-tuning ──
+            if page.access_count <= 1:
+                self.ghost_b1[evict_id] = timestamp
+                if len(self.ghost_b1) > self.ghost_max_size:
+                    self.ghost_b1.popitem(last=False)
+            else:
+                self.ghost_b2[evict_id] = timestamp
+                if len(self.ghost_b2) > self.ghost_max_size:
+                    self.ghost_b2.popitem(last=False)
+
             self.recent_evictions[evict_id] = timestamp
             self.recent_evictions = {
                 k: v for k, v in self.recent_evictions.items()
                 if timestamp - v < 120
             }
+
+    def _arc_adapt(self, app_id: int):
+        """ARC self-tuning: adjust recency/frequency balance on ghost hits."""
+        if app_id in self.ghost_b1:
+            # Ghost B1 hit → we need MORE recency (cache was too small for new items)
+            delta = max(1, len(self.ghost_b2)) / max(1, len(self.ghost_b1))
+            self.arc_p = min(1.0, self.arc_p + 0.05 * delta)
+            self.alpha = 0.3 + 0.2 * self.arc_p      # boost recency weight
+            self.beta = 0.3 - 0.1 * self.arc_p        # reduce frequency weight
+            self.ghost_b1.pop(app_id)
+            self.stats.ghost_hits_b1 += 1
+        elif app_id in self.ghost_b2:
+            # Ghost B2 hit → we need MORE frequency (cache evicted popular items)
+            delta = max(1, len(self.ghost_b1)) / max(1, len(self.ghost_b2))
+            self.arc_p = max(0.0, self.arc_p - 0.05 * delta)
+            self.alpha = 0.3 + 0.2 * self.arc_p
+            self.beta = 0.3 - 0.1 * self.arc_p
+            self.ghost_b2.pop(app_id)
+            self.stats.ghost_hits_b2 += 1
 
     def get_stats(self):
         return self.stats

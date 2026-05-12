@@ -127,6 +127,10 @@ def run_simulation(df, ensemble, device, total_memory_mb=4096,
             "preload_tier1_hits": as_.preload_tier1_hits,
             "preload_tier2_hits": as_.preload_tier2_hits,
             "preload_tier3_hits": as_.preload_tier3_hits,
+            "zram_hits": as_.zram_hits,
+            "zram_stores": as_.zram_stores,
+            "ghost_hits_b1": as_.ghost_hits_b1,
+            "ghost_hits_b2": as_.ghost_hits_b2,
             "total_accesses": as_.total_accesses,
             "inference_time_ms": as_.total_inference_time_ms,
             "energy_total_mj": as_.energy.total_mj,
@@ -247,8 +251,8 @@ def print_results(results, kv_stats, pressure_results=None):
     print(tabulate(rows, headers=["Metric","LRU","Adaptive","Change","Target","Status"],
                    tablefmt="grid"))
 
-    # ── Tiered Pre-loading Breakdown ──
-    print(f"\n  TIERED PRE-LOADING BREAKDOWN")
+    # ── Tiered Pre-loading + Page Clustering ──
+    print(f"\n  TIERED PRE-LOADING (with Page Clustering)")
     preload_rows = [
         ["Total Preloads", adp['preloads']],
         ["Total Preload Hits", adp['preload_hits']],
@@ -257,6 +261,23 @@ def print_results(results, kv_stats, pressure_results=None):
         ["  Tier 3 Hits (Full-RAM)", adp.get('preload_tier3_hits', 0)],
     ]
     print(tabulate(preload_rows, headers=["Metric", "Value"], tablefmt="grid"))
+
+    # ── ZRAM Compressed Tier ──
+    print(f"\n  ZRAM COMPRESSED RAM TIER")
+    zram_rows = [
+        ["ZRAM Stores (evicted → compressed)", adp.get('zram_stores', 0)],
+        ["ZRAM Hits (decompressed → RAM)", adp.get('zram_hits', 0)],
+        ["ZRAM Hit Rate", f"{adp.get('zram_hits',0)/max(1,adp.get('zram_stores',1)):.1%}"],
+    ]
+    print(tabulate(zram_rows, headers=["Metric", "Value"], tablefmt="grid"))
+
+    # ── ARC Self-Tuning ──
+    print(f"\n  ARC ADAPTIVE REPLACEMENT CACHE")
+    arc_rows = [
+        ["Ghost B1 Hits (need more recency)", adp.get('ghost_hits_b1', 0)],
+        ["Ghost B2 Hits (need more frequency)", adp.get('ghost_hits_b2', 0)],
+    ]
+    print(tabulate(arc_rows, headers=["Metric", "Value"], tablefmt="grid"))
 
     # ── Energy / Battery Profiling ──
     print(f"\n  ENERGY / BATTERY PROFILING")
