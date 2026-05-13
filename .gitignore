@@ -1,0 +1,31 @@
+study_materials/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Generated data (reproducible via run.py)
+data/
+models/
+results/
+docker-results/
+docker-models/
+
+# Reference/planning text files (not part of the solution)
+*.txt
+!requirements.txt
+*.md.resolved
+
+# Docker volumes
+docker-results/
+docker-models/
