@@ -1,0 +1,13 @@
+# Docker Compose for Context-Aware Adaptive Memory Management
+# Usage: docker compose up --build
+
+services:
+  simulation:
+    build: .
+    container_name: edge-memory-sim
+    volumes:
+      # Mount results directory to access charts and JSON from host
+      - ./docker-results:/app/results
+      - ./docker-models:/app/models
+    environment:
+      - PYTHONUNBUFFERED=1

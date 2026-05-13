@@ -39,7 +39,11 @@ def main():
     # ── Step 2: Train Predictor ──
     banner("STEP 2/7: Training Ensemble Predictor (LSTM + Markov)")
     from src.predictor import train_model
-    lstm_model, markov_model, history = train_model(df, epochs=40, batch_size=256,
+    import torch
+    # Auto-detect: use fewer epochs on CPU (Docker) to keep runtime ~10min
+    has_gpu = torch.cuda.is_available() or torch.backends.mps.is_available()
+    epochs = 40 if has_gpu else 15
+    lstm_model, markov_model, history = train_model(df, epochs=epochs, batch_size=256,
                                                      model_dir=model_dir)
 
     # ── Step 3: Standard Simulation (4GB) ──

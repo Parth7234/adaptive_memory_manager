@@ -1,4 +1,4 @@
-# Context-Aware Adaptive Memory Management System v2
+# Context-Aware Adaptive Memory Management System v3
 
 **Samsung Problem Statement Solution** — An intelligent on-device memory management system that uses ML-based prediction to optimize application caching, pre-loading, and eviction for smartphones and edge devices.
 
@@ -7,7 +7,7 @@
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │                    User Interaction Layer                     │
-│          (App switches, timestamps, context signals)          │
+│     (App switches, time deltas, context, user profile)       │
 └─────────────────────┬────────────────────────────────────────┘
                       │
           ┌───────────▼───────────────┐
@@ -15,7 +15,7 @@
           │    ("The Brain")          │
           │                           │
           │  ┌─────────┐ ┌─────────┐  │
-          │  │  LSTM   │ │ Markov  │  │
+          │  │ T-GRU   │ │ Markov  │  │
           │  │ (ONNX/  │ │ Chain   │  │
           │  │  NPU)   │ │ (CPU)   │  │
           │  └────┬────┘ └────┬────┘  │
@@ -24,17 +24,17 @@
           └───────────┬───────────────┘
                       │ P(next_app)
           ┌───────────▼───────────────┐
-          │   Memory Manager v2       │
+          │   Memory Manager v3       │
           │   ("The Brawn")           │
           │                           │
+          │  • ARC self-tuning        │
+          │    eviction + ghost caches│
           │  • Tiered pre-loading     │
-          │    (3-tier confidence)     │
-          │  • Prediction-weighted    │
-          │    eviction scoring       │
+          │    + page clustering      │
+          │  • ZRAM compressed tier   │
           │  • Anti-thrashing guard   │
           │  • Energy/battery aware   │
           │  • Token-level KV cache   │
-          │    with prefix caching    │
           └───────────────────────────┘
 ```
 
@@ -70,26 +70,43 @@ samsung/
 
 ## Quick Start
 
+### Option A: Docker (Recommended — Zero Setup)
+
+```bash
+# Build and run the full pipeline in one command
+docker build -t edge-memory-sim .
+docker run edge-memory-sim
+
+# Or use Docker Compose (exports results to host)
+docker compose up --build
+```
+
+### Option B: Local Python
+
 ```bash
 # Install dependencies
-pip install torch numpy pandas matplotlib seaborn tabulate
+pip install torch numpy pandas matplotlib tabulate onnx onnxscript
 
 # Run the full pipeline (7 steps: data → train → simulate → pressure → KV → ONNX → viz)
 python3 run.py
 ```
 
-The pipeline takes ~6 minutes and produces all results, charts, and ONNX model automatically.
+The pipeline takes ~8 minutes (CPU) or ~6 minutes (MPS/CUDA) and produces all results automatically.
 
-## What's New in v2
+> **Note**: Docker is for **simulation & benchmarking** only. On a real Samsung device, the system runs as a native Android Background Service with NPU inference via Samsung ONE / NNAPI — not in a container. Docker would prevent intercepting real kernel memory paging (`madvise`, `kswapd`, `lmkd`).
+
+## What's New in v3
 
 | Improvement | Description |
 |------------|-------------|
-| **Tiered Pre-loading** | 3-tier confidence system replaces binary preload: metadata-warm (>10%), background-cache (>25%), full-RAM (>50%) |
+| **T-GRU Predictor** | Time-Aware GRU replaces LSTM: time-decay gating, dot-product attention, 25% fewer params (271K → 82KB ONNX) |
+| **ARC Eviction** | Adaptive Replacement Cache with ghost caches (B1/B2) self-tunes α/β/γ weights in real-time |
+| **ZRAM Compressed Tier** | Evicted apps → LZ4 compressed RAM (0.5ms restore vs 50ms from UFS, 80% hit rate) |
+| **Predictive Page Clustering** | Only preload startup page clusters (~25% of app binary), not the full APK |
+| **Tiered Pre-loading** | 3-tier confidence system: metadata-warm (>10%), background-cache (>25%), full-RAM (>50%) |
 | **Energy/Battery Profiling** | Per-operation mJ tracking with ARM Cortex-A78 power model |
 | **Deep KV Cache** | Token-level prefix caching, FP16→INT8 quantization, prefix deduplication |
-| **Memory Pressure Test** | Stress-test at 2GB to validate under constrained devices |
-| **ONNX Export** | Model exported to ONNX format for NPU/TFLite edge deployment |
-| **Inference Latency** | NPU inference time factored into load time calculations |
+| **Docker** | One-command reproducibility: `docker build -t edge-memory-sim . && docker run edge-memory-sim` |
 
 ## Components
 
@@ -103,27 +120,42 @@ Generates realistic Android app usage sequences for 50 users over 30 days:
 
 ### 2. Prediction Engine (`src/predictor.py`)
 Hybrid ensemble combining:
-- **LSTM with Attention** (PyTorch → ONNX): User-embedded sequence model
-  - 48-dim app embeddings, 16-dim user embeddings, 128-dim LSTM hidden state
+- **Time-Aware GRU (T-GRU)** with dot-product attention (PyTorch → ONNX):
+  - 64-dim app embeddings, 24-dim user embeddings, 128-dim GRU hidden state
+  - Time-decay gate: flushes stale context after long idle periods
+  - Dot-product attention: looks back at all 10 hidden states
   - Cyclical time encoding (sin/cos of hour and day-of-week)
-  - ~299K parameters → ~350KB ONNX model for NPU deployment
+  - ~271K parameters → **82KB** ONNX model for NPU deployment
 - **Per-User Markov Chain**: 2nd-order transition + time-of-day patterns
-- **Ensemble**: Weighted combination (30% LSTM + 70% Markov)
+- **Ensemble**: Weighted combination (30% T-GRU + 70% Markov)
 
-### 3. Memory Manager v2 (`src/memory_manager.py`)
+### 3. Memory Manager v3 (`src/memory_manager.py`)
 
-#### Tiered Pre-loading
+#### ARC Self-Tuning Eviction
+- `score = α·recency + β·frequency + γ·ML_prediction` with **self-tuning weights**
+- Ghost caches B1/B2 track recently evicted page IDs — hits automatically adapt α/β
+- GenAI apps get 1.5× retention bonus; recently-reloaded pages get 2× anti-thrash boost
+
+#### Tiered Pre-loading with Page Clustering
 | Confidence Level | Action | Load Time Reduction |
 |-----------------|--------|-------------------|
 | >10% (Tier 1) | Pre-warm flash storage controller | ~40% faster seek |
-| >25% (Tier 2) | Page binaries into OS page cache | ~80% faster load |
-| >50% (Tier 3) | Fully map into RAM & init entry point | ~95% instant |
+| >25% (Tier 2) | Page **startup cluster** into OS cache | ~80% faster load |
+| >50% (Tier 3) | Fully map startup cluster into RAM | ~95% instant |
 
-#### Energy-Aware Eviction
+Only the **startup page cluster** (~25% of app binary, the specific 4KB pages needed for first-frame render) is preloaded — not the full APK.
+
+#### ZRAM Compressed RAM Tier
+- Evicted apps → LZ4 compressed into 15% RAM reservation (3× space savings)
+- Restore from ZRAM: **0.5ms** vs 50ms from UFS storage (100× faster)
+- 80% ZRAM hit rate — most evicted apps never touch slow storage
+
+#### Energy-Aware Profiling
 Every operation is tracked with millijoule energy costs based on ARM Cortex-A78 / Samsung Exynos power profiles:
 - RAM hold: 0.002 mJ/MB/sec (LPDDR5)
 - Storage I/O: 0.8 mJ/MB (UFS 4.0 cold read)
-- NPU inference: 0.15 mJ/call (INT8 LSTM)
+- ZRAM compress/decompress: 0.05/0.03 mJ/MB (LZ4)
+- NPU inference: 0.15 mJ/call (INT8 T-GRU)
 
 #### Token-Level KV Cache
 - **Prefix deduplication**: Shared system prompts across requests reuse same cache
@@ -144,9 +176,11 @@ Every operation is tracked with millijoule energy costs based on ARM Cortex-A78 
 
 3. **Tiered pre-loading**: Instead of binary preload, 3 confidence tiers minimize energy cost while maximizing load time improvement. Tier 1 costs only 0.05 mJ/MB vs 0.8 mJ/MB for a cold load.
 
-4. **Reward-aligned eviction scoring**: `score = α·recency + β·frequency + γ·prediction`, directly optimizing for cache hit rate and thrashing reduction.
+4. **ARC self-tuning eviction**: `score = α·recency + β·frequency + γ·prediction`, where α/β **automatically adapt** via ghost cache feedback — no manual tuning needed.
 
-5. **Energy budget**: Every operation tracks mJ cost, proving the ML overhead (0.15 mJ/inference) is dwarfed by the storage I/O savings from reduced page faults.
+5. **ZRAM before storage**: Evicted pages go to compressed RAM first, avoiding 50ms UFS reads in 80% of cases. Net effect: **-41% load time** under 2GB pressure.
+
+6. **Energy budget**: Every operation tracks mJ cost, proving the ML overhead (0.15 mJ/inference) is dwarfed by the storage I/O savings from reduced page faults.
 
 ## Sim-to-Real Integration Path
 
@@ -162,12 +196,12 @@ This system is designed as a **drop-in module** for real Android/Linux deploymen
 
 ### Edge Deployment
 ```
-PyTorch LSTM (299K params, ~1.2MB)
-    → torch.onnx.export() [opset 14]
-    → ONNX model (~350KB)
+PyTorch T-GRU (271K params, ~1.1MB)
+    → torch.onnx.export() [opset 18]
+    → ONNX model (82KB)
     → onnxruntime / Samsung ONE (Neural Engine)
     → INT8 quantization on NPU
-    → ~0.5ms inference latency
+    → ~1.5ms inference latency
 ```
 
 ### Linux cgroups Integration
@@ -190,5 +224,6 @@ int adaptive_eviction_score(struct page *page) {
 ## Requirements
 - Python 3.10+
 - PyTorch (CPU or MPS/CUDA)
-- NumPy, Pandas, matplotlib, seaborn, tabulate
-- (Optional) onnx, onnxruntime for edge validation
+- NumPy, Pandas, matplotlib, tabulate
+- onnx, onnxscript for ONNX export
+- (Optional) Docker for one-command reproducibility

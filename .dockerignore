@@ -1,0 +1,23 @@
+# Ignore generated data/models/results (will be regenerated inside container)
+data/
+models/
+results/
+
+# Ignore reference text files (but keep requirements.txt)
+*.txt
+!requirements.txt
+*.md.resolved
+
+# Ignore git and IDE files
+.git/
+.gitignore
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
+.idea/
+
+# Ignore Docker files themselves
+Dockerfile
+.dockerignore
+docker-compose.yml
